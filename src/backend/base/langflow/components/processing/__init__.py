@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from langflow.components.processing.python_repl_core import PythonREPLComponent
     from langflow.components.processing.regex import RegexExtractorComponent
     from langflow.components.processing.save_file import SaveToFileComponent
+    from langflow.components.processing.download_file import DownloadFileComponent
     from langflow.components.processing.select_data import SelectDataComponent
     from langflow.components.processing.split_text import SplitTextComponent
     from langflow.components.processing.structured_output import StructuredOutputComponent
@@ -61,6 +62,7 @@ _dynamic_imports = {
     "PythonREPLComponent": "python_repl_core",
     "RegexExtractorComponent": "regex",
     "SaveToFileComponent": "save_file",
+    "DownloadFileComponent": "download_file",
     "SelectDataComponent": "select_data",
     "SplitTextComponent": "split_text",
     "StructuredOutputComponent": "structured_output",
@@ -91,6 +93,7 @@ __all__ = [
     "PythonREPLComponent",
     "RegexExtractorComponent",
     "SaveToFileComponent",
+    "DownloadFileComponent",
     "SelectDataComponent",
     "SplitTextComponent",
     "StructuredOutputComponent",
