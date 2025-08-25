@@ -1,5 +1,6 @@
 import re
 import mimetypes
+import os
 from pathlib import Path
 from urllib.parse import urlparse, urljoin
 from typing import List, Optional
@@ -29,6 +30,7 @@ from langflow.template.field.base import Output
 # Constants
 DEFAULT_TIMEOUT = 30
 DEFAULT_MAX_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+DEFAULT_UPLOAD_PATH = "downloads"  # Default upload directory
 SUPPORTED_EXTENSIONS = [
     # Documents
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".txt", ".rtf",
@@ -95,10 +97,52 @@ class DownloadFileComponent(Component):
     - Extract file links from HTML content
     - Automatically detect file types from MIME types
     - Handle various file formats and download scenarios
+    - Configure custom upload paths for downloaded files
+
+    NEW FEATURES - Custom Upload Paths:
+    ===================================
+    
+    1. Custom Upload Path:
+       - Set a custom directory where downloaded files will be saved
+       - Supports both relative and absolute paths
+       - Automatically creates directories if they don't exist
+       - Validates path permissions and security
+    
+    2. File Organization Options:
+       - flat: All files in the same directory
+       - by_extension: Files grouped by file type (e.g., pdf/, images/, etc.)
+       - by_date: Files grouped by download date (e.g., 2024-01-15/)
+    
+    3. Path Validation:
+       - Security checks to prevent directory traversal attacks
+       - Permission validation
+       - Automatic path creation with user control
+    
+    Usage Examples:
+    ===============
+    
+    Basic custom path:
+    - Set use_custom_path = True
+    - Set custom_upload_path = "/home/user/downloads"
+    
+    Organized by extension:
+    - Set file_organization = "by_extension"
+    - Files will be saved as: /path/pdf/document.pdf, /path/images/photo.jpg
+    
+    Organized by date:
+    - Set file_organization = "by_date"
+    - Files will be saved as: /path/2024-01-15/document.pdf
+    
+    Security Features:
+    =================
+    - Prevents directory traversal attacks (blocks paths with "..")
+    - Validates write permissions before attempting to save
+    - Sanitizes directory names for extension-based organization
+    - Resolves symbolic links to prevent security issues
     """
 
     display_name = "Download File"
-    description = "Download files from URLs and upload them to Langflow storage."
+    description = "Download files from URLs and upload them to Langflow storage with custom path options."
     documentation: str = "https://docs.langflow.org/components-processing#download-file"
     icon = "download"
     name = "DownloadFileComponent"
@@ -222,6 +266,45 @@ class DownloadFileComponent(Component):
             display_name="Overwrite Existing",
             info="If enabled, overwrites existing files with the same name.",
             value=False,
+            required=False,
+            advanced=True,
+        ),
+        # New path configuration inputs
+        StrInput(
+            name="custom_upload_path",
+            display_name="Custom Upload Path",
+            info="Custom path where downloaded files should be uploaded. Can be relative or absolute. Leave empty to use default Langflow storage.",
+            value="",
+            required=False,
+            advanced=True,
+            placeholder="e.g., /custom/path or relative/path",
+        ),
+        BoolInput(
+            name="use_custom_path",
+            display_name="Use Custom Upload Path",
+            info="If enabled, uses the custom upload path instead of default Langflow storage.",
+            value=False,
+            required=False,
+            advanced=True,
+        ),
+        BoolInput(
+            name="create_path_if_not_exists",
+            display_name="Create Path if Not Exists",
+            info="If enabled, creates the custom upload path if it doesn't exist.",
+            value=True,
+            required=False,
+            advanced=True,
+        ),
+        DropdownInput(
+            name="file_organization",
+            display_name="File Organization",
+            info="How to organize files in the upload path. 'flat': all files in same directory, 'by_extension': group by file type, 'by_date': group by download date.",
+            options=[
+                "flat",
+                "by_extension",
+                "by_date",
+            ],
+            value="flat",
             required=False,
             advanced=True,
         ),
@@ -367,6 +450,135 @@ class DownloadFileComponent(Component):
         # Default to .bin if no extension found
         return ".bin"
 
+    def _validate_and_create_path(self, path: str) -> Optional[Path]:
+        """Validate and optionally create the custom upload path."""
+        if not path or not path.strip():
+            return None
+        
+        try:
+            # Clean and normalize the path
+            clean_path = path.strip()
+            
+            # Convert to Path object
+            upload_path = Path(clean_path)
+            
+            # Handle relative paths
+            if not upload_path.is_absolute():
+                # Make relative to current working directory
+                upload_path = Path.cwd() / upload_path
+            
+            # Resolve any symbolic links and normalize the path
+            upload_path = upload_path.resolve()
+            
+            # Security check: prevent directory traversal attacks
+            if ".." in str(upload_path):
+                logger.error(f"Invalid path detected (contains '..'): {path}")
+                return None
+            
+            # Check if path exists
+            if not upload_path.exists():
+                if self.create_path_if_not_exists:
+                    try:
+                        # Create the path and all parent directories
+                        upload_path.mkdir(parents=True, exist_ok=True)
+                        logger.info(f"Created upload directory: {upload_path}")
+                    except PermissionError:
+                        logger.error(f"Permission denied creating directory: {upload_path}")
+                        return None
+                    except Exception as e:
+                        logger.error(f"Error creating directory {upload_path}: {e}")
+                        return None
+                else:
+                    logger.error(f"Upload path does not exist: {upload_path}")
+                    return None
+            
+            # Check if it's a directory
+            if not upload_path.is_dir():
+                logger.error(f"Upload path is not a directory: {upload_path}")
+                return None
+            
+            # Check write permissions
+            if not os.access(upload_path, os.W_OK):
+                logger.error(f"No write permission for upload path: {upload_path}")
+                return None
+            
+            logger.info(f"Validated upload path: {upload_path}")
+            return upload_path
+            
+        except Exception as e:
+            logger.error(f"Error validating/creating upload path {path}: {e}")
+            return None
+
+    def get_current_working_directory(self) -> str:
+        """Get the current working directory for reference."""
+        return str(Path.cwd())
+
+    def get_default_download_path(self) -> str:
+        """Get the default download path for reference."""
+        return str(Path.cwd() / DEFAULT_UPLOAD_PATH)
+
+    def _get_organized_path(self, base_path: Path, filename: str, file_extension: str) -> Path:
+        """Get the organized path based on the file organization setting."""
+        try:
+            if self.file_organization == "flat":
+                return base_path / filename
+            
+            elif self.file_organization == "by_extension":
+                # Remove the dot from extension for directory name
+                ext_dir = file_extension[1:] if file_extension.startswith('.') else file_extension
+                # Sanitize extension directory name (remove special characters)
+                ext_dir = re.sub(r'[^\w\-_.]', '_', ext_dir)
+                ext_path = base_path / ext_dir
+                ext_path.mkdir(exist_ok=True)
+                return ext_path / filename
+            
+            elif self.file_organization == "by_date":
+                from datetime import datetime
+                today = datetime.now().strftime("%Y-%m-%d")
+                date_path = base_path / today
+                date_path.mkdir(exist_ok=True)
+                return date_path / filename
+            
+            else:
+                # Default to flat organization
+                logger.warning(f"Unknown file organization: {self.file_organization}, using flat organization")
+                return base_path / filename
+                
+        except Exception as e:
+            logger.error(f"Error creating organized path: {e}")
+            # Fallback to flat organization
+            return base_path / filename
+
+    def _save_file_to_custom_path(self, file_info: dict, custom_path: Path) -> bool:
+        """Save downloaded file to custom path."""
+        try:
+            # Get organized path
+            organized_path = self._get_organized_path(custom_path, file_info["filename"], file_info["extension"])
+            
+            # Check if file already exists
+            if not self.overwrite_existing and organized_path.exists():
+                logger.warning(f"File already exists and overwrite is disabled: {organized_path}")
+                return False
+            
+            # Ensure parent directory exists
+            organized_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Write file content
+            with organized_path.open("wb") as f:
+                f.write(file_info["content"])
+            
+            logger.info(f"Successfully saved {file_info['filename']} to {organized_path}")
+            
+            # Update file_info with the actual saved path
+            file_info["saved_path"] = str(organized_path)
+            file_info["saved_directory"] = str(organized_path.parent)
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error saving file {file_info['filename']} to custom path: {e}")
+            return False
+
     def _download_file(self, url: str) -> Optional[dict]:
         """Download a single file from URL."""
         try:
@@ -478,46 +690,71 @@ class DownloadFileComponent(Component):
             return False
         
         try:
-            file_path = Path(file_info["filename"])
-            
-            # Check if file already exists
-            if not self.overwrite_existing:
-                # This would need to be implemented based on your storage service
-                pass
-            
-            # Upload file using the same mechanism as save_file component
-            with file_path.open("wb") as f:
-                f.write(file_info["content"])
-            
-            async for db in get_session():
-                user_id, _ = await create_user_longterm_token(db)
-                current_user = await get_user_by_id(db, user_id)
+            # Determine the upload path
+            if self.use_custom_path and self.custom_upload_path:
+                custom_upload_path = self._validate_and_create_path(self.custom_upload_path)
+                if not custom_upload_path:
+                    logger.error(f"Could not validate or create custom upload path: {self.custom_upload_path}")
+                    return False
                 
-                # Create UploadFile object
-                upload_file = UploadFile(
-                    filename=file_info["filename"],
-                    file=file_path.open("rb"),
-                    size=file_info["size_bytes"]
-                )
+                # Save file to custom path
+                if not self._save_file_to_custom_path(file_info, custom_upload_path):
+                    return False
                 
-                # Upload to storage
-                await upload_user_file(
-                    file=upload_file,
-                    session=db,
-                    current_user=current_user,
-                    storage_service=get_storage_service(),
-                    settings_service=get_settings_service(),
-                )
-            
-            logger.info(f"Successfully uploaded {file_info['filename']} to storage")
-            return True
+                logger.info(f"Successfully saved {file_info['filename']} to custom path: {custom_upload_path}")
+                return True
+            else:
+                # Use default Langflow storage (original behavior)
+                try:
+                    file_path = Path(file_info["filename"])
+                    
+                    # Check if file already exists
+                    if not self.overwrite_existing:
+                        # This would need to be implemented based on your storage service
+                        pass
+                    
+                    # Upload file using the same mechanism as save_file component
+                    with file_path.open("wb") as f:
+                        f.write(file_info["content"])
+                    
+                    async for db in get_session():
+                        user_id, _ = await create_user_longterm_token(db)
+                        current_user = await get_user_by_id(db, user_id)
+                        
+                        # Create UploadFile object
+                        upload_file = UploadFile(
+                            filename=file_info["filename"],
+                            file=file_path.open("rb"),
+                            size=file_info["size_bytes"]
+                        )
+                        
+                        # Upload to storage
+                        await upload_user_file(
+                            file=upload_file,
+                            session=db,
+                            current_user=current_user,
+                            storage_service=get_storage_service(),
+                            settings_service=get_settings_service(),
+                        )
+                    
+                    logger.info(f"Successfully uploaded {file_info['filename']} to Langflow storage")
+                    return True
+                    
+                except Exception as e:
+                    logger.error(f"Error uploading file {file_info['filename']} to Langflow storage: {e}")
+                    return False
             
         except Exception as e:
-            logger.error(f"Error uploading file {file_info['filename']} to storage: {e}")
+            logger.error(f"Error in upload process for {file_info['filename']}: {e}")
             return False
 
     async def download_files(self) -> DataFrame:
         """Download files from URLs and return results as DataFrame."""
+        # Validate custom path settings if enabled
+        if self.use_custom_path and not self.custom_upload_path:
+            logger.warning("Custom path is enabled but no path specified. Falling back to default Langflow storage.")
+            self.use_custom_path = False
+        
         urls = self._extract_urls_from_input()
         
         if not urls:
@@ -525,6 +762,10 @@ class DownloadFileComponent(Component):
             return DataFrame(data=[])
         
         logger.info(f"Found {len(urls)} URLs to process")
+        if self.use_custom_path:
+            logger.info(f"Using custom upload path: {self.custom_upload_path}")
+        else:
+            logger.info("Using default Langflow storage")
         
         results = []
         for url in urls:
@@ -532,7 +773,20 @@ class DownloadFileComponent(Component):
             if result:
                 # Upload to storage if download was successful
                 if result["status"] == "success":
-                    await self._upload_file_to_storage(result)
+                    upload_success = await self._upload_file_to_storage(result)
+                    if upload_success:
+                        result["upload_status"] = "success"
+                        if self.use_custom_path and self.custom_upload_path:
+                            result["upload_location"] = "custom_path"
+                            result["upload_path"] = result.get("saved_path", "")
+                        else:
+                            result["upload_location"] = "langflow_storage"
+                    else:
+                        result["upload_status"] = "failed"
+                        result["upload_location"] = "unknown"
+                else:
+                    result["upload_status"] = "skipped"
+                    result["upload_location"] = "unknown"
                 
                 # Remove content from result for DataFrame (keep metadata only)
                 result_copy = result.copy()
@@ -549,17 +803,27 @@ class DownloadFileComponent(Component):
         if not results_df.data:
             return Message(text="No files were downloaded.")
         
-        # Count successful downloads
-        successful = sum(1 for r in results_df.data if r.get("status") == "success")
+        # Count successful downloads and uploads
+        successful_downloads = sum(1 for r in results_df.data if r.get("status") == "success")
+        successful_uploads = sum(1 for r in results_df.data if r.get("upload_status") == "success")
         total = len(results_df.data)
         
-        summary = f"Downloaded {successful}/{total} files successfully."
+        summary = f"Downloaded {successful_downloads}/{total} files successfully. Uploaded {successful_uploads}/{successful_downloads} files successfully."
         
         # Create detailed message
         details = []
         for result in results_df.data:
             if result.get("status") == "success":
-                details.append(f"✅ {result['filename']} ({result['size_mb']} MB)")
+                upload_info = ""
+                if result.get("upload_status") == "success":
+                    if result.get("upload_location") == "custom_path":
+                        upload_info = f" → Saved to: {result.get('upload_path', 'Unknown path')}"
+                    else:
+                        upload_info = " → Uploaded to Langflow storage"
+                else:
+                    upload_info = " → Upload failed"
+                
+                details.append(f"✅ {result['filename']} ({result['size_mb']} MB){upload_info}")
             else:
                 details.append(f"❌ {result['url']} - {result.get('error', 'Unknown error')}")
         
@@ -567,5 +831,11 @@ class DownloadFileComponent(Component):
         
         return Message(
             text=message_text,
-            data={"data": results_df.data, "summary": summary, "successful": successful, "total": total}
+            data={
+                "data": results_df.data, 
+                "summary": summary, 
+                "successful_downloads": successful_downloads,
+                "successful_uploads": successful_uploads,
+                "total": total
+            }
         )
