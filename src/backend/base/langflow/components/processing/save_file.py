@@ -9,7 +9,7 @@ from fastapi.encoders import jsonable_encoder
 
 from langflow.api.v2.files import upload_user_file
 from langflow.custom import Component
-from langflow.io import DropdownInput, MessageTextInput, StrInput
+from langflow.io import DropdownInput, HandleInput, StrInput
 from langflow.schema import Data, DataFrame, Message
 from langflow.services.database.models.user.crud import get_user_by_id
 from langflow.services.deps import get_settings_service, get_storage_service, session_scope
@@ -18,7 +18,7 @@ from langflow.template.field.base import Output
 
 class SaveToFileComponent(Component):
     display_name = "Save File"
-    description = "Save data to a local file in the selected format. Can be used as a tool in agent flows."
+    description = "Save data to a local file in the selected format."
     documentation: str = "https://docs.langflow.org/components-processing#save-file"
     icon = "save"
     name = "SaveToFile"
@@ -28,27 +28,19 @@ class SaveToFileComponent(Component):
     MESSAGE_FORMAT_CHOICES = ["txt", "json", "markdown"]
 
     inputs = [
-        MessageTextInput(
+        HandleInput(
             name="input",
             display_name="Input",
-            info="The input to save (text content).",
+            info="The input to save.",
+            dynamic=True,
+            input_types=["Data", "DataFrame", "Message"],
             required=True,
-            tool_mode=True,  # Enable tool mode for this input
         ),
         StrInput(
             name="file_name",
             display_name="File Name",
             info="Name file will be saved as (without extension).",
             required=True,
-            tool_mode=True,  # Enable tool mode for this input
-        ),
-        StrInput(
-            name="folder_path",
-            display_name="Folder Path",
-            info="Path to the folder where the file should be saved. If not provided, saves to current working directory.",
-            required=False,
-            tool_mode=True,  # Enable tool mode for this input
-            advanced=True,
         ),
         DropdownInput(
             name="file_format",
@@ -57,18 +49,10 @@ class SaveToFileComponent(Component):
             info="Select the file format to save the input. If not provided, the default format will be used.",
             value="",
             advanced=True,
-            tool_mode=True,  # Enable tool mode for this input
         ),
     ]
 
-    outputs = [
-        Output(display_name="File Path", name="message", method="save_to_file", tool_mode=True),
-        Output(display_name="Tool", name="tool", method="build_tool", tool_mode=True)
-    ]
-
-    def __init__(self, **data) -> None:
-        super().__init__(**data)
-        self.add_tool_output = True  # Enable tool output generation
+    outputs = [Output(display_name="File Path", name="message", method="save_to_file")]
 
     async def save_to_file(self) -> Message:
         """Save the input to a file and upload it, returning a confirmation message."""
@@ -76,52 +60,67 @@ class SaveToFileComponent(Component):
         if not self.file_name:
             msg = "File name must be provided."
             raise ValueError(msg)
-        if not self.input:
-            msg = "Input content must be provided."
+        if not self._get_input_type():
+            msg = "Input type is not set."
             raise ValueError(msg)
 
         # Validate file format based on input type
         file_format = self.file_format or self._get_default_format()
-        allowed_formats = self.MESSAGE_FORMAT_CHOICES  # Since we're using MessageTextInput
+        allowed_formats = (
+            self.MESSAGE_FORMAT_CHOICES if self._get_input_type() == "Message" else self.DATA_FORMAT_CHOICES
+        )
         if file_format not in allowed_formats:
-            msg = f"Invalid file format '{file_format}'. Allowed: {allowed_formats}"
+            msg = f"Invalid file format '{file_format}' for {self._get_input_type()}. Allowed: {allowed_formats}"
             raise ValueError(msg)
 
-        # Prepare file path with folder
-        if self.folder_path:
-            # Use the specified folder path
-            folder_path = Path(self.folder_path).expanduser().resolve()
-            if not folder_path.exists():
-                folder_path.mkdir(parents=True, exist_ok=True)
-            file_path = folder_path / self.file_name
-        else:
-            # Use current working directory
-            file_path = Path(self.file_name).expanduser()
-            if not file_path.parent.exists():
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-        
+        # Prepare file path
+        file_path = Path(self.file_name).expanduser()
+        if not file_path.parent.exists():
+            file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path = self._adjust_file_path_with_format(file_path, file_format)
 
-        # Save the input as a message
-        confirmation = await self._save_message_text(self.input, file_path, file_format)
+        # Save the input to file based on type
+        if self._get_input_type() == "DataFrame":
+            confirmation = self._save_dataframe(self.input, file_path, file_format)
+        elif self._get_input_type() == "Data":
+            confirmation = self._save_data(self.input, file_path, file_format)
+        elif self._get_input_type() == "Message":
+            confirmation = await self._save_message(self.input, file_path, file_format)
+        else:
+            msg = f"Unsupported input type: {self._get_input_type()}"
+            raise ValueError(msg)
 
         # Upload the saved file
         await self._upload_file(file_path)
 
         # Return the final file path and confirmation message
-        final_path = file_path.resolve()
+        final_path = Path.cwd() / file_path if not file_path.is_absolute() else file_path
 
         return Message(text=f"{confirmation} at {final_path}")
 
-    async def build_tool(self):
-        """Build the tool representation for agent use."""
-        # This method is required for tool mode
-        # The actual tool functionality is handled by the save_to_file method
-        return await self.save_to_file()
+    def _get_input_type(self) -> str:
+        """Determine the input type based on the provided input."""
+        # Use exact type checking (type() is) instead of isinstance() to avoid inheritance issues.
+        # Since Message inherits from Data, isinstance(message, Data) would return True for Message objects,
+        # causing Message inputs to be incorrectly identified as Data type.
+        if type(self.input) is DataFrame:
+            return "DataFrame"
+        if type(self.input) is Message:
+            return "Message"
+        if type(self.input) is Data:
+            return "Data"
+        msg = f"Unsupported input type: {type(self.input)}"
+        raise ValueError(msg)
 
     def _get_default_format(self) -> str:
-        """Return the default file format for text input."""
-        return "txt"
+        """Return the default file format based on input type."""
+        if self._get_input_type() == "DataFrame":
+            return "csv"
+        if self._get_input_type() == "Data":
+            return "json"
+        if self._get_input_type() == "Message":
+            return "json"
+        return "json"  # Fallback
 
     def _adjust_file_path_with_format(self, path: Path, fmt: str) -> Path:
         """Adjust the file path to include the correct extension."""
@@ -151,15 +150,59 @@ class SaveToFileComponent(Component):
                     settings_service=get_settings_service(),
                 )
 
-    async def _save_message_text(self, text_content: str, path: Path, fmt: str) -> str:
-        """Save text content to the specified file format."""
-        if fmt == "txt":
-            path.write_text(text_content, encoding="utf-8")
+    def _save_dataframe(self, dataframe: DataFrame, path: Path, fmt: str) -> str:
+        """Save a DataFrame to the specified file format."""
+        if fmt == "csv":
+            dataframe.to_csv(path, index=False)
+        elif fmt == "excel":
+            dataframe.to_excel(path, index=False, engine="openpyxl")
         elif fmt == "json":
-            path.write_text(json.dumps({"content": text_content}, indent=2), encoding="utf-8")
+            dataframe.to_json(path, orient="records", indent=2)
         elif fmt == "markdown":
-            path.write_text(f"{text_content}", encoding="utf-8")
+            path.write_text(dataframe.to_markdown(index=False), encoding="utf-8")
         else:
-            msg = f"Unsupported format: {fmt}"
+            msg = f"Unsupported DataFrame format: {fmt}"
             raise ValueError(msg)
-        return f"Content saved successfully as '{path}'"
+        return f"DataFrame saved successfully as '{path}'"
+
+    def _save_data(self, data: Data, path: Path, fmt: str) -> str:
+        """Save a Data object to the specified file format."""
+        if fmt == "csv":
+            pd.DataFrame(data.data).to_csv(path, index=False)
+        elif fmt == "excel":
+            pd.DataFrame(data.data).to_excel(path, index=False, engine="openpyxl")
+        elif fmt == "json":
+            path.write_text(
+                orjson.dumps(jsonable_encoder(data.data), option=orjson.OPT_INDENT_2).decode("utf-8"), encoding="utf-8"
+            )
+        elif fmt == "markdown":
+            path.write_text(pd.DataFrame(data.data).to_markdown(index=False), encoding="utf-8")
+        else:
+            msg = f"Unsupported Data format: {fmt}"
+            raise ValueError(msg)
+        return f"Data saved successfully as '{path}'"
+
+    async def _save_message(self, message: Message, path: Path, fmt: str) -> str:
+        """Save a Message to the specified file format, handling async iterators."""
+        content = ""
+        if message.text is None:
+            content = ""
+        elif isinstance(message.text, AsyncIterator):
+            async for item in message.text:
+                content += str(item) + " "
+            content = content.strip()
+        elif isinstance(message.text, Iterator):
+            content = " ".join(str(item) for item in message.text)
+        else:
+            content = str(message.text)
+
+        if fmt == "txt":
+            path.write_text(content, encoding="utf-8")
+        elif fmt == "json":
+            path.write_text(json.dumps({"message": content}, indent=2), encoding="utf-8")
+        elif fmt == "markdown":
+            path.write_text(f"**Message:**\n\n{content}", encoding="utf-8")
+        else:
+            msg = f"Unsupported Message format: {fmt}"
+            raise ValueError(msg)
+        return f"Message saved successfully as '{path}'"
